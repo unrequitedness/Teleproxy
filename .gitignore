@@ -1,0 +1,31 @@
+# --- Generic ---
+*.pyc
+__pycache__/
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# --- Python / desktop ---
+desktop/.venv/
+desktop/build/
+desktop/dist/
+desktop/*.egg-info/
+
+# --- Android ---
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.kotlin/
+android/captures/
+android/.cxx/
+android/*.iml
+
+# --- Keystore (DO NOT commit) ---
+*.jks
+*.keystore
+
+# --- Pre-built artefacts go to GitHub Releases ---
+release/
+
