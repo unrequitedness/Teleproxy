@@ -296,14 +296,14 @@ def glass_card(parent, *, padx: int = 0, pady: int = 0,
         fg_color=body,
         border_color=stroke,
         border_width=1,
-        corner_radius=16,
+        corner_radius=18,
     )
-    # 1-pixel top highlight stripe (purely decorative).
+    # Top edge highlight stripe (the "glass" reflection).
     hi = ctk.CTkFrame(
         frame, fg_color=PALETTE["highlight"],
         corner_radius=0, height=1, border_width=0,
     )
-    hi.place(relx=0.04, rely=0.0, relwidth=0.92, y=2)
+    hi.place(relx=0.05, rely=0.0, relwidth=0.90, y=3)
     return frame
 
 
@@ -431,16 +431,17 @@ class MainWindow:
         self.tabs = ctk.CTkSegmentedButton(
             tab_wrap,
             values=["Главная", "Настройки", "Журнал"],
-            fg_color=PALETTE["card_lo"],
-            selected_color=PALETTE["accent"],
-            selected_hover_color=PALETTE["accent_hi"],
-            unselected_color=PALETTE["card_lo"],
-            unselected_hover_color=PALETTE["card"],
-            text_color="#1A1630",
+            fg_color=PALETTE["card"],
+            selected_color=PALETTE["accent_lo"],
+            selected_hover_color=PALETTE["accent"],
+            unselected_color=PALETTE["card"],
+            unselected_hover_color=PALETTE["card_hi"],
+            text_color=PALETTE["text"],
+            text_color_disabled=PALETTE["text_mute"],
             font=("Segoe UI Semibold", 12),
             corner_radius=14,
             command=self._on_tab_changed,
-            height=38,
+            height=42,
         )
         self.tabs.pack(fill="x", pady=4)
         self.tabs.set("Главная")
@@ -511,17 +512,26 @@ class MainWindow:
         )
         self.hero_subtitle.pack(anchor="w", pady=(4, 0))
 
-        # Round power button
+        # Round power button (true circle: width=height, corner_radius=half)
+        power_halo = ctk.CTkFrame(
+            inner, fg_color=PALETTE["card_hi"],
+            border_color=PALETTE["stroke_focus"], border_width=2,
+            corner_radius=60, width=110, height=110,
+        )
+        power_halo.pack(side="right", padx=(8, 0))
+        power_halo.pack_propagate(False)
+
         self.power_btn = ctk.CTkButton(
-            inner, text="⏻", width=80, height=80,
+            power_halo, text="⏻", width=92, height=92,
             fg_color=PALETTE["accent"],
             hover_color=PALETTE["accent_hi"],
             text_color="#1A1630",
-            font=("Segoe UI Symbol", 30),
-            corner_radius=80,  # circle
+            font=("Segoe UI Symbol", 36, "bold"),
+            corner_radius=46,  # half of 92 → perfect circle
+            border_width=0,
             command=self._toggle_power,
         )
-        self.power_btn.pack(side="right")
+        self.power_btn.place(relx=0.5, rely=0.5, anchor="center")
 
         # Action tiles
         actions = ctk.CTkFrame(page, fg_color="transparent")
