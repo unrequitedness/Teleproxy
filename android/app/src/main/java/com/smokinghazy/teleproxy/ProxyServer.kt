@@ -217,6 +217,16 @@ class ProxyServer(
         val down = scope.launch {
             pump(rIn, cOut) { chunk -> ctx.cltEnc.update(ctx.tgDec.update(chunk)) }
         }
+        // When one side finishes (client or upstream EOF / error) drag the other
+        // along immediately — otherwise we'd sit on a blocked read for ~24 s.
+        up.invokeOnCompletion {
+            try { remote.close() } catch (_: Throwable) {}
+            down.cancel()
+        }
+        down.invokeOnCompletion {
+            try { remote.close() } catch (_: Throwable) {}
+            up.cancel()
+        }
         try { up.join(); down.join() }
         catch (_: CancellationException) {}
         finally {
@@ -260,7 +270,6 @@ class ProxyServer(
                     }
                 }
             } catch (_: Throwable) {}
-            try { ws.close() } catch (_: Throwable) {}
         }
         val down = scope.launch {
             try {
@@ -273,9 +282,34 @@ class ProxyServer(
                 }
             } catch (_: Throwable) {}
         }
+        // App-level keep-alive: Cloudflare drops idle WS at ~30 s. Sending a
+        // PING every 25 s keeps the tunnel hot and turns the "session closed"
+        // race into a no-op.
+        val ka = scope.launch {
+            try {
+                while (isActive && !ws.isClosed()) {
+                    delay(25_000)
+                    if (!ws.isClosed()) {
+                        if (!ws.sendPing()) break
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
+        // Tear down the whole session as soon as either direction ends.
+        up.invokeOnCompletion {
+            try { ws.close() } catch (_: Throwable) {}
+            down.cancel()
+            ka.cancel()
+        }
+        down.invokeOnCompletion {
+            try { ws.close() } catch (_: Throwable) {}
+            up.cancel()
+            ka.cancel()
+        }
         try { up.join(); down.join() }
         catch (_: CancellationException) {}
         finally {
+            ka.cancel()
             try { ws.close() } catch (_: Throwable) {}
             onLog("[$label] WS session closed")
         }

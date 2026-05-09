@@ -9,12 +9,16 @@ ctk_path = os.path.dirname(customtkinter.__file__)
 SPEC_DIR = os.path.dirname(SPEC)
 ROOT = os.path.join(SPEC_DIR, os.pardir)
 
-icon_path = os.path.join(ROOT, 'smoke_icon.ico')
+icon_path = os.path.join(ROOT, 'teleproxy_icon.ico')
 if not os.path.exists(icon_path):
     icon_path = os.path.join(ROOT, 'icon.ico')
 
+version_path = os.path.join(SPEC_DIR, 'version_info.txt')
+if not os.path.exists(version_path):
+    version_path = None
+
 a = Analysis(
-    [os.path.join(ROOT, 'smokinghazy.py')],
+    [os.path.join(ROOT, 'teleproxy.py')],
     pathex=[ROOT],
     binaries=[],
     datas=[
@@ -77,4 +81,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=icon_path if os.path.exists(icon_path) else None,
+    version=version_path,
 )

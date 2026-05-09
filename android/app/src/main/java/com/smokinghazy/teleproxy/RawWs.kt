@@ -20,8 +20,11 @@ import javax.net.ssl.X509TrustManager
 /**
  * Direct port of proxy/raw_websocket.py — minimal WebSocket client
  * (RFC 6455 binary frames, client-masked) over TLS to kws<dc>.web.telegram.org.
- * Mirrors the original which disables certificate verification because
- * connections target arbitrary IPs and reuse SNI for routing.
+ *
+ * IMPORTANT: every write to [output] goes through [writeLock], otherwise the
+ * up-direction's binary frames and the down-direction's PONG/CLOSE responses
+ * would interleave on the wire and the server would close the session as
+ * malformed (the "ws session closed" log spam users hit on chatty links).
  */
 class RawWs private constructor(
     private val socket: SSLSocket,
@@ -31,20 +34,51 @@ class RawWs private constructor(
     @Volatile private var closed = false
     private val rng = SecureRandom()
 
+    /** Single mutex guarding ALL writes to [output] (frames are not splittable). */
+    private val writeLock = Any()
+
     fun isClosed() = closed
 
-    @Synchronized
     fun sendBinary(data: ByteArray) {
         if (closed) throw IOException("ws closed")
-        output.write(buildFrame(OP_BINARY, data))
-        output.flush()
+        val frame = buildFrame(OP_BINARY, data)
+        synchronized(writeLock) {
+            if (closed) throw IOException("ws closed")
+            output.write(frame)
+            output.flush()
+        }
     }
 
-    @Synchronized
     fun sendBatch(parts: List<ByteArray>) {
         if (closed) throw IOException("ws closed")
-        for (p in parts) output.write(buildFrame(OP_BINARY, p))
-        output.flush()
+        if (parts.isEmpty()) return
+        // Build all frames first so we hold the lock for as little time as possible.
+        val frames = ArrayList<ByteArray>(parts.size)
+        for (p in parts) frames.add(buildFrame(OP_BINARY, p))
+        synchronized(writeLock) {
+            if (closed) throw IOException("ws closed")
+            for (fr in frames) output.write(fr)
+            output.flush()
+        }
+    }
+
+    /**
+     * Application-level keep-alive: pings via WS PING frame. Cloudflare closes
+     * idle WS sessions after ~30s, so the proxy needs to ping a bit faster.
+     */
+    fun sendPing(payload: ByteArray = EMPTY): Boolean {
+        if (closed) return false
+        return try {
+            val frame = buildFrame(OP_PING, payload)
+            synchronized(writeLock) {
+                if (closed) return false
+                output.write(frame)
+                output.flush()
+            }
+            true
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     /** Reads next non-control frame; returns null on close. */
@@ -54,17 +88,17 @@ class RawWs private constructor(
             when (op) {
                 OP_CLOSE -> {
                     closed = true
+                    val echo = if (payload.size >= 2) payload.copyOfRange(0, 2) else EMPTY
+                    val frame = buildFrame(OP_CLOSE, echo)
                     try {
-                        output.write(buildFrame(OP_CLOSE,
-                            if (payload.size >= 2) payload.copyOfRange(0, 2) else ByteArray(0)))
-                        output.flush()
+                        synchronized(writeLock) { output.write(frame); output.flush() }
                     } catch (_: Throwable) {}
                     return null
                 }
                 OP_PING -> {
+                    val frame = buildFrame(OP_PONG, payload)
                     try {
-                        output.write(buildFrame(OP_PONG, payload))
-                        output.flush()
+                        synchronized(writeLock) { output.write(frame); output.flush() }
                     } catch (_: Throwable) {}
                 }
                 OP_PONG -> { /* ignore */ }
@@ -78,9 +112,9 @@ class RawWs private constructor(
     fun close() {
         if (closed) return
         closed = true
+        val frame = buildFrame(OP_CLOSE, EMPTY)
         try {
-            output.write(buildFrame(OP_CLOSE, ByteArray(0)))
-            output.flush()
+            synchronized(writeLock) { output.write(frame); output.flush() }
         } catch (_: Throwable) {}
         try { socket.close() } catch (_: Throwable) {}
     }
@@ -158,6 +192,8 @@ class RawWs private constructor(
         const val OP_PING = 0x9
         const val OP_PONG = 0xA
 
+        private val EMPTY = ByteArray(0)
+
         private val INSECURE_TRUST_ALL: Array<TrustManager> = arrayOf(object : X509TrustManager {
             override fun checkClientTrusted(p0: Array<out X509Certificate>?, p1: String?) {}
             override fun checkServerTrusted(p0: Array<out X509Certificate>?, p1: String?) {}
@@ -177,6 +213,9 @@ class RawWs private constructor(
         fun connect(host: String, domain: String, timeoutMs: Int = 10_000): RawWs {
             val raw = Socket()
             raw.tcpNoDelay = true
+            // Enable TCP keep-alive on the upstream so dead-NAT entries don't
+            // turn into 24-second hang spikes.
+            try { raw.keepAlive = true } catch (_: Throwable) {}
             raw.connect(InetSocketAddress(host, 443), timeoutMs)
             val ssl = sslFactory.createSocket(raw, host, 443, true) as SSLSocket
             // Enable SNI = domain (separate from connect target IP)

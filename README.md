@@ -10,7 +10,7 @@
 | Windows x64   | Python 3.11 + customtkinter + PyInstaller | `release/Teleproxy-windows-x64.exe`       |
 | Android 7.0+  | Kotlin + Jetpack Compose          | `release/Teleproxy-android.apk`             |
 
-> Author: **smokinghazy**
+> Author: **Nysiusa**
 
 ---
 
@@ -141,8 +141,13 @@ cd android
 
 ### Windows-специфика
 
-- `customtkinter` для тёмной темы.
-- `pystray` + Pillow для трея и окна.
+- `customtkinter` для тёмной темы + собственный `utils/glass.py` для
+  Mica/Acrylic/BlurBehind backdrop (Win 10/11).
+- `pystray` + Pillow для системного трея и иконки окна.
+- Закрытие крестика **сворачивает в трей**, не убивает прокси. Полноценный
+  выход — пункт «Выход» в меню трея.
+- Чекбокс «Запускать с Windows» добавляет запись в
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` с флагом `--minimized`.
 - PyInstaller `onefile` режим. На Wine при сборке падает PE-checksum
   (нет `imagehlp.dll`); патч уже учтён в spec-файле.
 
@@ -155,4 +160,4 @@ cd android
 ## Благодарности
 
 В Python-версии используется ядро MTProto-моста, основанное на работе сообщества
-энтузиастов; UI-обвязка, Android-порт и упаковка — мои.
+энтузиастов; UI-обвязка, Android-порт, упаковка и сопровождение — Nysiusa.
