@@ -298,12 +298,12 @@ def glass_card(parent, *, padx: int = 0, pady: int = 0,
         border_width=1,
         corner_radius=16,
     )
-    # 2-pixel top highlight stripe (purely decorative).
+    # 1-pixel top highlight stripe (purely decorative).
     hi = ctk.CTkFrame(
         frame, fg_color=PALETTE["highlight"],
-        corner_radius=0, height=2, border_width=0,
+        corner_radius=0, height=1, border_width=0,
     )
-    hi.place(relx=0.0, rely=0.0, relwidth=1.0, y=2, height=1)
+    hi.place(relx=0.04, rely=0.0, relwidth=0.92, y=2)
     return frame
 
 
