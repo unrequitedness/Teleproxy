@@ -5,8 +5,8 @@
 
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 1, 0, 0),
-    prodvers=(1, 1, 0, 0),
+    filevers=(1, 1, 1, 0),
+    prodvers=(1, 1, 1, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -22,12 +22,12 @@ VSVersionInfo(
           [
             StringStruct(u'CompanyName',     u'Nysiusa'),
             StringStruct(u'FileDescription', u'Teleproxy — local MTProto bridge proxy'),
-            StringStruct(u'FileVersion',     u'1.1.0.0'),
+            StringStruct(u'FileVersion',     u'1.1.1.0'),
             StringStruct(u'InternalName',    u'Teleproxy'),
             StringStruct(u'LegalCopyright',  u'Copyright (c) 2026 Nysiusa'),
             StringStruct(u'OriginalFilename',u'Teleproxy.exe'),
             StringStruct(u'ProductName',     u'Teleproxy'),
-            StringStruct(u'ProductVersion',  u'1.1.0.0'),
+            StringStruct(u'ProductVersion',  u'1.1.1.0'),
           ]
         )
       ]

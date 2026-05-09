@@ -1,8 +1,14 @@
 """
 Teleproxy — by Nysiusa.
 
-Local MTProto bridge proxy with a customtkinter glassmorphism UI,
+Local MTProto bridge proxy with a modern tabbed glassmorphism UI,
 system tray, autostart and start-minimized support.
+
+Performance note: window-level DWM Mica/Acrylic backdrop is intentionally
+disabled. It causes severe drag lag on Tk-on-Windows because every pixel of
+window movement forces the desktop compositor to re-blur the area underneath.
+Glass aesthetic is painted *inside* the UI instead — soft violet backdrop,
+translucent-feeling cards with stroke + top highlight.
 """
 from __future__ import annotations
 
@@ -32,22 +38,23 @@ except ImportError:
     tk = None
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw, ImageFilter
 except ImportError:
     Image = None
+    ImageDraw = None
+    ImageFilter = None
 
 try:
     import pystray
 except ImportError:
     pystray = None
 
-from proxy import __version__, get_link_host
+from proxy import __version__
 from utils import autostart
-from utils.glass import apply_glass
 from utils.tray_common import (
-    APP_NAME, DEFAULT_CONFIG, IS_FROZEN, LOG_FILE,
-    acquire_lock, bootstrap, ensure_dirs, load_config,
-    release_lock, restart_proxy, save_config, start_proxy, stop_proxy,
+    DEFAULT_CONFIG, LOG_FILE,
+    acquire_lock, bootstrap, load_config,
+    release_lock, save_config, start_proxy, stop_proxy,
     tg_proxy_url,
 )
 
@@ -55,41 +62,48 @@ log = logging.getLogger("tg-ws-tray")
 
 
 # ---------------------------------------------------------------------------
-# Palette — refined glass theme
+# Glass palette
 # ---------------------------------------------------------------------------
 PALETTE = {
-    "void":         "#0E0B1F",  # deepest, behind glass
-    "glass":        "#1A1530",  # opaque card body
-    "glass_hi":     "#241C44",  # raised card body
-    "glass_lo":     "#15112A",  # recessed surface (inputs)
-    "stroke":       "#2E2553",  # subtle border
-    "stroke_hi":    "#4B3A8E",  # focused border / tile separator
-    "accent":       "#BD93F9",  # primary violet
-    "accent_hi":    "#D9C2FF",  # bright hover
+    # Base layers
+    "bg":           "#0B0820",   # solid window bg (no transparency, no blur)
+    "card":         "#1A1635",   # raised glass card body
+    "card_hi":      "#241D49",   # active / hover card
+    "card_lo":      "#13102B",   # input/recessed
+    "highlight":    "#2F2557",   # top-edge highlight stripe
+    "stroke":       "#322763",   # subtle border
+    "stroke_focus": "#7E5BD9",   # focused / accent border
+    # Brand
+    "accent":       "#BD93F9",
+    "accent_hi":    "#DDC4FF",
     "accent_lo":    "#7E5BD9",
-    "accent_dim":   "#5A40A0",
-    "success":      "#7CE3A8",
-    "warning":      "#FFCB6B",
-    "danger":       "#FF7E9C",
-    "text":         "#EFEAFF",
+    "accent_dim":   "#4D3A85",
+    # Status colors
+    "ok":           "#7CE3A8",
+    "ok_dim":       "#3F8C66",
+    "warn":         "#FFCB6B",
+    "err":          "#FF7E9C",
+    "err_dim":      "#9C3A56",
+    # Text
+    "text":         "#F2EEFF",
     "text_dim":     "#B5ADD4",
     "text_mute":    "#7C7599",
 }
 
 APP_TITLE = "Teleproxy"
 AUTHOR = "Nysiusa"
-ICON_PATH_PRIMARY = str(Path(__file__).parent / "teleproxy_icon.ico")
-ICON_PATH_FALLBACK = str(Path(__file__).parent / "icon.ico")
+ICON_PRIMARY = str(Path(__file__).parent / "teleproxy_icon.ico")
+ICON_FALLBACK = str(Path(__file__).parent / "icon.ico")
 
 
 def _icon_path() -> str:
-    if Path(ICON_PATH_PRIMARY).exists():
-        return ICON_PATH_PRIMARY
-    return ICON_PATH_FALLBACK
+    if Path(ICON_PRIMARY).exists():
+        return ICON_PRIMARY
+    return ICON_FALLBACK
 
 
 # ---------------------------------------------------------------------------
-# Win32 mutex (single-instance)
+# Single-instance mutex (Win32)
 # ---------------------------------------------------------------------------
 _win_mutex_handle = None
 _ERROR_ALREADY_EXISTS = 183
@@ -123,6 +137,44 @@ def _release_win_mutex() -> None:
         except Exception:
             pass
         _win_mutex_handle = None
+
+
+# ---------------------------------------------------------------------------
+# Backdrop — Pillow-rendered soft gradient with blurry violet highlights.
+# Renders ONCE at startup, never on resize/drag, so it adds zero cost
+# when the window is moved.
+# ---------------------------------------------------------------------------
+
+def render_backdrop(w: int, h: int) -> Optional["Image.Image"]:
+    if Image is None:
+        return None
+    base = Image.new("RGB", (w, h), tuple(int(PALETTE["bg"][i:i+2], 16) for i in (1, 3, 5)))
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(overlay)
+    # Big violet top-left blob
+    d.ellipse(
+        [-w * 0.10, -h * 0.30, w * 0.55, h * 0.45],
+        fill=(126, 91, 217, 170),
+    )
+    # Magenta-ish mid blob
+    d.ellipse(
+        [w * 0.30, h * 0.30, w * 0.85, h * 0.85],
+        fill=(189, 147, 249, 110),
+    )
+    # Deep blue bottom-right blob
+    d.ellipse(
+        [w * 0.55, h * 0.55, w * 1.20, h * 1.30],
+        fill=(40, 30, 130, 200),
+    )
+    # Tiny accent
+    d.ellipse(
+        [w * 0.05, h * 0.55, w * 0.30, h * 0.85],
+        fill=(98, 67, 195, 140),
+    )
+    overlay = overlay.filter(ImageFilter.GaussianBlur(radius=140))
+    base = base.convert("RGBA")
+    base = Image.alpha_composite(base, overlay).convert("RGB")
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -166,11 +218,9 @@ class LogTailer:
 
 
 # ---------------------------------------------------------------------------
-# System tray
+# Tray
 # ---------------------------------------------------------------------------
 class TrayController:
-    """Thin wrapper around pystray that runs in its own thread."""
-
     def __init__(self, on_show, on_toggle, on_exit, get_running) -> None:
         self.on_show = on_show
         self.on_toggle = on_toggle
@@ -205,18 +255,13 @@ class TrayController:
 
         menu = pystray.Menu(
             pystray.MenuItem("Открыть Teleproxy", _show, default=True),
-            pystray.MenuItem(
-                "Запущен",
-                _toggle,
-                checked=lambda _: bool(self.get_running()),
-            ),
+            pystray.MenuItem("Запущен", _toggle,
+                             checked=lambda _: bool(self.get_running())),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Выход", _quit),
         )
         self._icon = pystray.Icon("Teleproxy", img, "Teleproxy", menu)
-        self._thread = threading.Thread(
-            target=self._icon.run, daemon=True, name="tray",
-        )
+        self._thread = threading.Thread(target=self._icon.run, daemon=True, name="tray")
         self._thread.start()
 
     def refresh(self) -> None:
@@ -236,16 +281,30 @@ class TrayController:
 
 
 # ---------------------------------------------------------------------------
-# Glass card helper — frame with subtle border + soft inner highlight stripe
+# Glass card helper.
+#
+# A "glass" card is a CTkFrame in card body color with a 1px top-edge
+# highlight strip. On a violet gradient backdrop this reads as frosted glass
+# without any per-frame compositing cost.
 # ---------------------------------------------------------------------------
-def make_card(parent, *, body=PALETTE["glass_hi"], stroke=PALETTE["stroke"]):
-    return ctk.CTkFrame(
+def glass_card(parent, *, padx: int = 0, pady: int = 0,
+               body=None, stroke=None) -> "ctk.CTkFrame":
+    body = body or PALETTE["card"]
+    stroke = stroke or PALETTE["stroke"]
+    frame = ctk.CTkFrame(
         parent,
         fg_color=body,
         border_color=stroke,
         border_width=1,
-        corner_radius=14,
+        corner_radius=16,
     )
+    # 2-pixel top highlight stripe (purely decorative).
+    hi = ctk.CTkFrame(
+        frame, fg_color=PALETTE["highlight"],
+        corner_radius=0, height=2, border_width=0,
+    )
+    hi.place(relx=0.0, rely=0.0, relwidth=1.0, y=2, height=1)
+    return frame
 
 
 # ---------------------------------------------------------------------------
@@ -259,28 +318,25 @@ class MainWindow:
         self.log_q: "queue.Queue[str]" = queue.Queue()
         self.tailer = LogTailer(self.log_q)
         self._exiting = False
-        self._tray_notice_shown = False
 
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
 
         self.root = ctk.CTk()
         self.root.title(APP_TITLE)
-        self.root.geometry("900x640")
-        self.root.minsize(820, 580)
-        self.root.configure(fg_color=PALETTE["void"])
+        self.root.geometry("980x680")
+        self.root.minsize(900, 620)
+        self.root.configure(fg_color=PALETTE["bg"])
         try:
             self.root.iconbitmap(_icon_path())
         except Exception:
             pass
 
-        # Window translucency for the glass feel.
-        try:
-            self.root.attributes("-alpha", 0.985)
-        except Exception:
-            pass
+        # Pre-rendered violet gradient backdrop (rendered once, no DWM blur).
+        self._backdrop_ctk: Optional["ctk.CTkImage"] = None
+        self._backdrop_label: Optional["ctk.CTkLabel"] = None
+        self._setup_backdrop(1280, 900)
 
-        # Tray needs to be ready before the window is hidden via close-to-tray.
         self.tray = TrayController(
             on_show=self._tray_show,
             on_toggle=self._tray_toggle,
@@ -291,141 +347,296 @@ class MainWindow:
         self._build_ui()
         self._poll_log()
 
-        # Apply blur after widgets exist so HWND is settled.
-        self.root.after(50, lambda: apply_glass(self.root))
-
-        # Start proxy automatically when launched normally.
-        self.root.after(200, self._start)
+        # Start proxy automatically when not invoked --minimized.
+        self.root.after(150, self._start)
 
         # Tray
         self.tray.start()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Escape>", lambda _e: self._minimize_to_tray())
 
         if start_minimized:
             self.root.after(20, self._minimize_to_tray)
 
-    # ---- UI construction -------------------------------------------------
+    # ---- backdrop --------------------------------------------------------
+    def _setup_backdrop(self, w: int, h: int) -> None:
+        if Image is None:
+            return
+        try:
+            img = render_backdrop(w, h)
+            if img is None:
+                return
+            self._backdrop_ctk = ctk.CTkImage(light_image=img, dark_image=img,
+                                              size=(w, h))
+            self._backdrop_label = ctk.CTkLabel(
+                self.root, text="", image=self._backdrop_ctk,
+                fg_color=PALETTE["bg"],
+            )
+            self._backdrop_label.place(relx=0.5, rely=0.5, anchor="center")
+            self._backdrop_label.lower()
+        except Exception as exc:
+            log.debug("backdrop render failed: %s", exc)
 
+    # ---- top-level layout ------------------------------------------------
     def _build_ui(self) -> None:
-        # Header bar
-        header = ctk.CTkFrame(self.root, fg_color=PALETTE["glass"], corner_radius=0,
-                              border_width=0, height=64)
-        header.pack(fill="x", side="top")
+        # Header — simple, no compositing.
+        header = ctk.CTkFrame(self.root, fg_color="transparent", height=64)
+        header.pack(fill="x", side="top", padx=20, pady=(14, 0))
         header.pack_propagate(False)
 
-        title_row = ctk.CTkFrame(header, fg_color="transparent")
-        title_row.pack(fill="both", expand=True, padx=18, pady=10)
-
-        # Logo + name
         ctk.CTkLabel(
-            title_row, text="⚡",
-            font=("Segoe UI Emoji", 22),
+            header, text="⚡",
+            font=("Segoe UI Emoji", 24),
             text_color=PALETTE["accent_hi"],
-        ).pack(side="left", padx=(0, 6))
+        ).pack(side="left", padx=(0, 4))
         ctk.CTkLabel(
-            title_row, text="Teleproxy",
+            header, text="Teleproxy",
             font=("Segoe UI Semibold", 22),
             text_color=PALETTE["text"],
         ).pack(side="left")
         ctk.CTkLabel(
-            title_row, text=f"v{__version__}",
+            header, text=f"v{__version__}",
             font=("Segoe UI", 11),
             text_color=PALETTE["text_mute"],
         ).pack(side="left", padx=(10, 0), pady=(8, 0))
 
-        # Status pill on the right.
+        # Right: status pill + minimize button
+        right = ctk.CTkFrame(header, fg_color="transparent")
+        right.pack(side="right")
+
         self.status_pill = ctk.CTkLabel(
-            title_row,
-            text="●  остановлен",
+            right, text="●  остановлен",
             font=("Segoe UI Semibold", 11),
-            text_color=PALETTE["danger"],
-            fg_color=PALETTE["glass_lo"],
-            corner_radius=12,
+            text_color=PALETTE["err"],
+            fg_color=PALETTE["card_lo"],
+            corner_radius=14,
             height=28,
         )
-        self.status_pill.pack(side="right", ipadx=12, ipady=2)
+        self.status_pill.pack(side="left", ipadx=14, ipady=2)
 
-        # Warning banner (hidden by default).
-        self.banner = ctk.CTkLabel(
-            self.root, text="",
-            font=("Segoe UI Semibold", 11),
+        ctk.CTkButton(
+            right, text="—", width=34, height=28,
+            fg_color=PALETTE["card_lo"], hover_color=PALETTE["card"],
+            text_color=PALETTE["text_dim"],
+            font=("Segoe UI", 14),
+            corner_radius=12,
+            command=self._minimize_to_tray,
+        ).pack(side="left", padx=(8, 0))
+
+        # Tabs (segmented button)
+        tab_wrap = ctk.CTkFrame(self.root, fg_color="transparent")
+        tab_wrap.pack(fill="x", padx=20, pady=(12, 0))
+
+        self.tabs = ctk.CTkSegmentedButton(
+            tab_wrap,
+            values=["Главная", "Настройки", "Журнал"],
+            fg_color=PALETTE["card_lo"],
+            selected_color=PALETTE["accent"],
+            selected_hover_color=PALETTE["accent_hi"],
+            unselected_color=PALETTE["card_lo"],
+            unselected_hover_color=PALETTE["card"],
             text_color="#1A1630",
-            fg_color=PALETTE["warning"],
-            corner_radius=0,
-            anchor="w", justify="left", height=28,
+            font=("Segoe UI Semibold", 12),
+            corner_radius=14,
+            command=self._on_tab_changed,
+            height=38,
         )
+        self.tabs.pack(fill="x", pady=4)
+        self.tabs.set("Главная")
 
-        # Main body — two cards, glass style.
-        body = ctk.CTkFrame(self.root, fg_color=PALETTE["void"], corner_radius=0)
-        self._body = body
-        body.pack(fill="both", expand=True, padx=14, pady=(10, 6))
-        body.grid_columnconfigure(0, weight=0, minsize=380)
-        body.grid_columnconfigure(1, weight=1)
-        body.grid_rowconfigure(0, weight=1)
+        # Content stack
+        self._stack = ctk.CTkFrame(self.root, fg_color="transparent")
+        self._stack.pack(fill="both", expand=True, padx=20, pady=(12, 0))
 
-        left = make_card(body)
-        left.grid(row=0, column=0, sticky="nsw", padx=(0, 7))
-        right = make_card(body)
-        right.grid(row=0, column=1, sticky="nsew", padx=(7, 0))
-
-        self._build_left(left)
-        self._build_right(right)
+        self._tab_home = self._build_home_tab()
+        self._tab_settings = self._build_settings_tab()
+        self._tab_log = self._build_log_tab()
+        self._on_tab_changed("Главная")
 
         # Footer
-        footer = ctk.CTkFrame(self.root, fg_color=PALETTE["void"],
-                              corner_radius=0, height=26)
-        footer.pack(fill="x", side="bottom", padx=14, pady=(0, 8))
+        footer = ctk.CTkFrame(self.root, fg_color="transparent", height=28)
+        footer.pack(fill="x", side="bottom", padx=20, pady=(6, 10))
         ctk.CTkLabel(
             footer,
-            text=f"by {AUTHOR}  ·  лог: {LOG_FILE}",
-            font=("Segoe UI", 9),
+            text=f"by {AUTHOR}",
+            font=("Segoe UI", 10),
             text_color=PALETTE["text_mute"],
         ).pack(side="left")
         ctk.CTkLabel(
             footer,
-            text="Esc — свернуть в трей",
-            font=("Segoe UI", 9),
+            text="Esc / крестик — свернуть в трей",
+            font=("Segoe UI", 10),
             text_color=PALETTE["text_mute"],
         ).pack(side="right")
 
-        # Esc -> minimize-to-tray.
-        self.root.bind("<Escape>", lambda _e: self._minimize_to_tray())
+    # ---- HOME tab --------------------------------------------------------
+    def _build_home_tab(self) -> "ctk.CTkFrame":
+        page = ctk.CTkFrame(self._stack, fg_color="transparent")
+        page.grid_rowconfigure(1, weight=1)
+        page.grid_columnconfigure(0, weight=1)
 
-    def _build_left(self, parent) -> None:
-        pad = 16
+        # Hero card with status orb + power button.
+        hero = glass_card(page)
+        hero.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 12))
 
-        # Top label
-        self._section_label(parent, "ПОДКЛЮЧЕНИЕ").pack(
-            fill="x", padx=pad, pady=(pad, 6),
+        inner = ctk.CTkFrame(hero, fg_color="transparent")
+        inner.pack(fill="x", padx=24, pady=22)
+
+        # Status orb (color label that changes)
+        self.orb = ctk.CTkLabel(
+            inner, text="◉",
+            font=("Segoe UI Symbol", 56),
+            text_color=PALETTE["err_dim"],
+            fg_color="transparent",
+            width=72, height=72,
+        )
+        self.orb.pack(side="left", padx=(0, 18))
+
+        text_col = ctk.CTkFrame(inner, fg_color="transparent")
+        text_col.pack(side="left", fill="x", expand=True)
+
+        self.hero_title = ctk.CTkLabel(
+            text_col, text="Прокси остановлен",
+            font=("Segoe UI Semibold", 22),
+            text_color=PALETTE["text"], anchor="w",
+        )
+        self.hero_title.pack(anchor="w")
+
+        self.hero_subtitle = ctk.CTkLabel(
+            text_col,
+            text="Нажми кнопку справа, чтобы запустить.",
+            font=("Segoe UI", 11),
+            text_color=PALETTE["text_dim"], anchor="w",
+        )
+        self.hero_subtitle.pack(anchor="w", pady=(4, 0))
+
+        # Round power button
+        self.power_btn = ctk.CTkButton(
+            inner, text="⏻", width=80, height=80,
+            fg_color=PALETTE["accent"],
+            hover_color=PALETTE["accent_hi"],
+            text_color="#1A1630",
+            font=("Segoe UI Symbol", 30),
+            corner_radius=80,  # circle
+            command=self._toggle_power,
+        )
+        self.power_btn.pack(side="right")
+
+        # Action tiles
+        actions = ctk.CTkFrame(page, fg_color="transparent")
+        actions.grid(row=1, column=0, sticky="nsew")
+        for i in range(3):
+            actions.grid_columnconfigure(i, weight=1, uniform="tile")
+        actions.grid_rowconfigure(0, weight=0)
+        actions.grid_rowconfigure(1, weight=1)
+
+        self._action_tile(
+            actions, row=0, col=0,
+            icon="📲", title="Открыть в Telegram",
+            sub="Применить настройки и пробросить ссылку в клиент",
+            primary=True,
+            command=self._apply_and_add,
+        )
+        self._action_tile(
+            actions, row=0, col=1,
+            icon="🔗", title="Скопировать ссылку",
+            sub="tg://proxy?... в буфер обмена",
+            command=self._copy_link,
+        )
+        self._action_tile(
+            actions, row=0, col=2,
+            icon="📂", title="Открыть лог",
+            sub=str(LOG_FILE),
+            command=self._open_log_file,
         )
 
+        # Link banner
+        link_card = glass_card(actions, body=PALETTE["card_lo"])
+        link_card.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        ctk.CTkLabel(
+            link_card, text="ССЫЛКА ДЛЯ TELEGRAM",
+            font=("Segoe UI Semibold", 9),
+            text_color=PALETTE["accent"], anchor="w",
+        ).pack(fill="x", padx=14, pady=(10, 2))
+        self.lbl_link = ctk.CTkLabel(
+            link_card, text=self._link(),
+            font=("Cascadia Mono", 11),
+            text_color=PALETTE["accent_hi"], anchor="w", justify="left",
+        )
+        self.lbl_link.pack(fill="x", padx=14, pady=(0, 12))
+
+        return page
+
+    def _action_tile(self, parent, *, row: int, col: int,
+                     icon: str, title: str, sub: str,
+                     command, primary: bool = False) -> None:
+        body = PALETTE["card_hi"] if primary else PALETTE["card"]
+        tile = glass_card(parent, body=body,
+                          stroke=PALETTE["stroke_focus"] if primary else PALETTE["stroke"])
+        tile.grid(row=row, column=col, sticky="nsew",
+                  padx=(0 if col == 0 else 6, 0 if col == 2 else 6))
+
+        # Whole-tile click: bind through inner content
+        inner = ctk.CTkFrame(tile, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=14, pady=14)
+
+        ctk.CTkLabel(
+            inner, text=icon,
+            font=("Segoe UI Emoji", 22),
+            text_color=PALETTE["accent_hi"] if primary else PALETTE["accent"],
+            anchor="w",
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            inner, text=title,
+            font=("Segoe UI Semibold", 13),
+            text_color=PALETTE["text"], anchor="w", justify="left",
+        ).pack(anchor="w", pady=(6, 0))
+        ctk.CTkLabel(
+            inner, text=sub,
+            font=("Segoe UI", 10),
+            text_color=PALETTE["text_dim"], anchor="w", justify="left",
+            wraplength=220,
+        ).pack(anchor="w", pady=(2, 0))
+
+        for w in (tile, inner) + tuple(inner.winfo_children()):
+            w.bind("<Button-1>", lambda _e, c=command: c())
+
+    # ---- SETTINGS tab ----------------------------------------------------
+    def _build_settings_tab(self) -> "ctk.CTkFrame":
+        page = ctk.CTkFrame(self._stack, fg_color="transparent")
+        page.grid_columnconfigure(0, weight=1)
+        page.grid_columnconfigure(1, weight=1)
+
+        # --- Connection card -----------------------------------------------
+        conn = glass_card(page)
+        conn.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 0))
+        self._section_title(conn, "ПОДКЛЮЧЕНИЕ")
+
         # host/port row
-        row = ctk.CTkFrame(parent, fg_color="transparent")
-        row.pack(fill="x", padx=pad, pady=(0, 8))
+        row = ctk.CTkFrame(conn, fg_color="transparent")
+        row.pack(fill="x", padx=18, pady=(0, 4))
         row.grid_columnconfigure(0, weight=3)
         row.grid_columnconfigure(1, weight=1)
-
         self._micro(row, "Адрес").grid(row=0, column=0, sticky="w")
         self._micro(row, "Порт").grid(row=0, column=1, sticky="w", padx=(8, 0))
         self.e_host = self._entry(row, self.cfg.get("host", DEFAULT_CONFIG["host"]))
         self.e_host.grid(row=1, column=0, sticky="ew", pady=(2, 0))
         self.e_port = self._entry(row, str(self.cfg.get("port", DEFAULT_CONFIG["port"])))
         self.e_port.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(2, 0))
-
-        self.e_host.bind("<KeyRelease>", lambda *_: self._update_banner())
-        self.e_port.bind("<KeyRelease>", lambda *_: self._update_banner())
+        self.e_host.bind("<KeyRelease>", lambda *_: self._on_cfg_dirty())
+        self.e_port.bind("<KeyRelease>", lambda *_: self._on_cfg_dirty())
 
         # secret
-        self._micro(parent, "Секрет (32 hex)").pack(fill="x", padx=pad, pady=(8, 2))
-        sec_row = ctk.CTkFrame(parent, fg_color="transparent")
-        sec_row.pack(fill="x", padx=pad, pady=(0, 4))
+        self._micro(conn, "Секрет (32 hex)").pack(fill="x", padx=18, pady=(10, 2))
+        sec_row = ctk.CTkFrame(conn, fg_color="transparent")
+        sec_row.pack(fill="x", padx=18, pady=(0, 4))
         sec_row.grid_columnconfigure(0, weight=1)
         self.e_secret = self._entry(sec_row, self.cfg.get("secret", DEFAULT_CONFIG["secret"]))
         self.e_secret.grid(row=0, column=0, sticky="ew")
-        self.e_secret.bind("<KeyRelease>", lambda *_: self._update_banner())
+        self.e_secret.bind("<KeyRelease>", lambda *_: self._on_cfg_dirty())
         ctk.CTkButton(
-            sec_row, text="Новый", width=72, height=32,
+            sec_row, text="Новый", width=80, height=32,
             fg_color=PALETTE["accent_dim"], hover_color=PALETTE["accent_lo"],
             text_color=PALETTE["text"],
             font=("Segoe UI Semibold", 11),
@@ -433,124 +644,114 @@ class MainWindow:
             command=self._regen_secret,
         ).grid(row=0, column=1, padx=(8, 0))
 
-        # advanced section
-        self._section_label(parent, "ДОПОЛНИТЕЛЬНО").pack(
-            fill="x", padx=pad, pady=(pad, 4),
-        )
-
+        # network toggles
+        self._section_title(conn, "СЕТЬ", pady=(20, 4))
         self.var_cf = tk.BooleanVar(value=self.cfg.get("cfproxy", True))
         self.var_cf_prio = tk.BooleanVar(value=self.cfg.get("cfproxy_priority", True))
+        self._switch(conn, "WebSocket через Cloudflare",
+                     "Маскирует трафик под HTTPS — обходит блокировку прямых DC IP",
+                     self.var_cf, command=self._on_cfg_dirty,
+                     ).pack(fill="x", padx=18, pady=(2, 0))
+        self._switch(conn, "CF раньше прямого TCP",
+                     "Сначала пробовать Cloudflare, потом TCP",
+                     self.var_cf_prio, command=self._on_cfg_dirty,
+                     ).pack(fill="x", padx=18, pady=(8, 14))
 
-        self._checkbox(parent, "WebSocket через Cloudflare",
-                       self.var_cf).pack(fill="x", padx=pad, pady=(2, 0))
-        self._checkbox(parent, "CF раньше прямого TCP",
-                       self.var_cf_prio).pack(fill="x", padx=pad, pady=(2, 4))
+        # Apply button at bottom
+        ctk.CTkButton(
+            conn, text="Применить и перезапустить", height=38,
+            fg_color=PALETTE["accent"], hover_color=PALETTE["accent_hi"],
+            text_color="#1A1630",
+            font=("Segoe UI Semibold", 12),
+            corner_radius=12,
+            command=self._start,
+        ).pack(fill="x", padx=18, pady=(0, 16))
 
-        # system section
-        self._section_label(parent, "СИСТЕМА").pack(
-            fill="x", padx=pad, pady=(pad, 4),
-        )
+        # --- Startup card --------------------------------------------------
+        startup = glass_card(page)
+        startup.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        self._section_title(startup, "ЗАПУСК С WINDOWS")
+
+        ctk.CTkLabel(
+            startup,
+            text=("Если включить — Teleproxy будет автоматически стартовать при\n"
+                  "входе в Windows и сразу уходить в системный трей. Само окно\n"
+                  "выскакивать не будет, прокси сразу начнёт работать в фоне."),
+            font=("Segoe UI", 11),
+            text_color=PALETTE["text_dim"],
+            justify="left", anchor="w",
+        ).pack(fill="x", padx=18, pady=(0, 12))
 
         self.var_autostart = tk.BooleanVar(value=autostart.is_enabled())
         self.var_start_minimized = tk.BooleanVar(
             value=bool(self.cfg.get("start_minimized", False)),
         )
 
-        autostart_chk = self._checkbox(
-            parent, "Запускать с Windows", self.var_autostart,
-            command=self._on_autostart_toggle,
+        autostart_sw = self._switch(
+            startup, "Автозапуск с Windows",
+            "Запись в HKCU\\…\\Run с флагом --minimized",
+            self.var_autostart, command=self._on_autostart_toggle,
         )
-        autostart_chk.pack(fill="x", padx=pad, pady=(2, 0))
+        autostart_sw.pack(fill="x", padx=18, pady=(2, 4))
         if not autostart.is_supported():
-            autostart_chk.configure(
-                state="disabled",
-                text="Запускать с Windows  (только для .exe)",
-            )
+            for child in autostart_sw.winfo_children():
+                try:
+                    child.configure(state="disabled")
+                except Exception:
+                    pass
+            ctk.CTkLabel(
+                startup,
+                text="⚠  Автозапуск работает только из собранного .exe",
+                font=("Segoe UI", 10),
+                text_color=PALETTE["warn"], anchor="w",
+            ).pack(fill="x", padx=18, pady=(0, 4))
 
-        self._checkbox(
-            parent, "Стартовать свёрнутым в трей",
-            self.var_start_minimized,
-            command=self._on_start_minimized_toggle,
-        ).pack(fill="x", padx=pad, pady=(2, 8))
+        self._switch(
+            startup, "Стартовать сразу в трее",
+            "Окно не появляется при запуске, прокси сразу в фоне",
+            self.var_start_minimized, command=self._on_start_minimized_toggle,
+        ).pack(fill="x", padx=18, pady=(2, 14))
 
-        # actions
-        self._section_label(parent, "УПРАВЛЕНИЕ").pack(
-            fill="x", padx=pad, pady=(pad, 6),
-        )
-
-        btn_row_1 = ctk.CTkFrame(parent, fg_color="transparent")
-        btn_row_1.pack(fill="x", padx=pad, pady=(0, 6))
-        btn_row_1.grid_columnconfigure(0, weight=1)
-        btn_row_1.grid_columnconfigure(1, weight=1)
-
-        self.btn_start = ctk.CTkButton(
-            btn_row_1, text="Запустить", height=42,
-            fg_color=PALETTE["accent"], hover_color=PALETTE["accent_hi"],
-            text_color="#1A1630",
-            font=("Segoe UI Semibold", 13),
-            corner_radius=12,
-            command=self._start,
-        )
-        self.btn_start.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-
-        self.btn_stop = ctk.CTkButton(
-            btn_row_1, text="Остановить", height=42,
-            fg_color=PALETTE["glass_lo"], hover_color=PALETTE["stroke"],
-            text_color=PALETTE["text"],
-            font=("Segoe UI Semibold", 13),
-            corner_radius=12,
-            command=self._stop,
-        )
-        self.btn_stop.grid(row=0, column=1, sticky="ew", padx=(4, 0))
-
+        # Big primary action — minimize to tray now
         ctk.CTkButton(
-            parent, text="⚡  Применить и добавить в Telegram", height=44,
+            startup, text="Свернуть в трей сейчас", height=40,
             fg_color=PALETTE["accent"], hover_color=PALETTE["accent_hi"],
             text_color="#1A1630",
             font=("Segoe UI Semibold", 12),
             corner_radius=12,
-            command=self._apply_and_add,
-        ).pack(fill="x", padx=pad, pady=(4, 4))
+            command=self._minimize_to_tray,
+        ).pack(fill="x", padx=18, pady=(0, 8))
 
         ctk.CTkButton(
-            parent, text="Открыть в Telegram", height=34,
-            fg_color=PALETTE["accent_dim"], hover_color=PALETTE["accent_lo"],
-            text_color=PALETTE["text"],
-            font=("Segoe UI", 11),
-            corner_radius=10,
-            command=self._open_in_telegram,
-        ).pack(fill="x", padx=pad, pady=(2, 2))
-
-        ctk.CTkButton(
-            parent, text="Скопировать ссылку", height=34,
-            fg_color=PALETTE["glass_lo"], hover_color=PALETTE["stroke"],
-            text_color=PALETTE["text"],
-            font=("Segoe UI", 11),
-            corner_radius=10,
-            command=self._copy_link,
-        ).pack(fill="x", padx=pad, pady=(2, 2))
-
-        ctk.CTkButton(
-            parent, text="Открыть файл логов", height=30,
-            fg_color="transparent", hover_color=PALETTE["glass_lo"],
+            startup, text="Полностью выйти", height=34,
+            fg_color=PALETTE["card_lo"], hover_color=PALETTE["card"],
             text_color=PALETTE["text_dim"],
-            font=("Segoe UI", 10),
-            corner_radius=8,
-            command=self._open_log_file,
-        ).pack(fill="x", padx=pad, pady=(4, pad))
+            font=("Segoe UI", 11),
+            corner_radius=10,
+            command=self._real_exit,
+        ).pack(fill="x", padx=18, pady=(0, 16))
 
-    def _build_right(self, parent) -> None:
-        pad = 16
-        head = ctk.CTkFrame(parent, fg_color="transparent")
-        head.pack(fill="x", padx=pad, pady=(pad, 6))
+        return page
+
+    # ---- LOG tab ---------------------------------------------------------
+    def _build_log_tab(self) -> "ctk.CTkFrame":
+        page = ctk.CTkFrame(self._stack, fg_color="transparent")
+        page.grid_rowconfigure(0, weight=1)
+        page.grid_columnconfigure(0, weight=1)
+
+        card = glass_card(page)
+        card.grid(row=0, column=0, sticky="nsew")
+
+        head = ctk.CTkFrame(card, fg_color="transparent")
+        head.pack(fill="x", padx=18, pady=(14, 6))
         ctk.CTkLabel(
             head, text="ЖУРНАЛ",
-            font=("Segoe UI Semibold", 11),
+            font=("Segoe UI Semibold", 10),
             text_color=PALETTE["accent"],
         ).pack(side="left")
         ctk.CTkButton(
             head, text="Очистить", width=92, height=28,
-            fg_color=PALETTE["glass_lo"], hover_color=PALETTE["stroke"],
+            fg_color=PALETTE["card_lo"], hover_color=PALETTE["card"],
             text_color=PALETTE["text_dim"],
             font=("Segoe UI", 10),
             corner_radius=8,
@@ -558,8 +759,8 @@ class MainWindow:
         ).pack(side="right")
 
         self.txt = ctk.CTkTextbox(
-            parent,
-            fg_color=PALETTE["glass_lo"],
+            card,
+            fg_color=PALETTE["card_lo"],
             text_color=PALETTE["text"],
             border_color=PALETTE["stroke"],
             border_width=1,
@@ -567,57 +768,30 @@ class MainWindow:
             font=("Cascadia Mono", 10),
             wrap="none",
         )
-        self.txt.pack(fill="both", expand=True, padx=pad, pady=(0, pad))
+        self.txt.pack(fill="both", expand=True, padx=18, pady=(0, 18))
         self.txt.configure(state="disabled")
 
-        # link row
-        link_card = ctk.CTkFrame(
-            parent,
-            fg_color=PALETTE["glass_lo"],
-            border_color=PALETTE["stroke"],
-            border_width=1,
-            corner_radius=10,
-        )
-        link_card.pack(fill="x", padx=pad, pady=(0, pad))
+        return page
 
-        link_inner = ctk.CTkFrame(link_card, fg_color="transparent")
-        link_inner.pack(fill="x", padx=10, pady=8)
-
-        ctk.CTkLabel(
-            link_inner, text="Ссылка для Telegram",
-            font=("Segoe UI", 9),
-            text_color=PALETTE["text_mute"],
-        ).pack(anchor="w")
-        self.lbl_link = ctk.CTkLabel(
-            link_inner, text=self._link(),
-            font=("Cascadia Mono", 10),
-            text_color=PALETTE["accent_hi"],
-            anchor="w", justify="left",
-        )
-        self.lbl_link.pack(fill="x", anchor="w")
-
-    # ---- helpers ---------------------------------------------------------
-
-    def _section_label(self, parent, text: str):
+    # ---- shared widget helpers ------------------------------------------
+    def _section_title(self, parent, text: str, pady=(14, 4)):
         return ctk.CTkLabel(
             parent, text=text,
             font=("Segoe UI Semibold", 10),
-            text_color=PALETTE["accent"],
-            anchor="w",
-        )
+            text_color=PALETTE["accent"], anchor="w",
+        ).pack(fill="x", padx=18, pady=pady)
 
     def _micro(self, parent, text: str):
         return ctk.CTkLabel(
             parent, text=text,
             font=("Segoe UI", 9),
-            text_color=PALETTE["text_mute"],
-            anchor="w",
+            text_color=PALETTE["text_mute"], anchor="w",
         )
 
     def _entry(self, parent, value: str):
         e = ctk.CTkEntry(
             parent,
-            fg_color=PALETTE["glass_lo"],
+            fg_color=PALETTE["card_lo"],
             text_color=PALETTE["text"],
             border_color=PALETTE["stroke"],
             border_width=1,
@@ -628,29 +802,72 @@ class MainWindow:
         e.insert(0, value)
         return e
 
-    def _checkbox(self, parent, text: str, var, *, command=None):
-        return ctk.CTkCheckBox(
-            parent, text=text, variable=var,
-            fg_color=PALETTE["accent"],
-            hover_color=PALETTE["accent_hi"],
-            border_color=PALETTE["stroke_hi"],
-            checkmark_color="#1A1630",
-            text_color=PALETTE["text"],
-            font=("Segoe UI", 11),
-            command=command,
-        )
+    def _switch(self, parent, label: str, sub: str, var, *, command=None) -> "ctk.CTkFrame":
+        wrap = ctk.CTkFrame(parent, fg_color="transparent")
+        text_col = ctk.CTkFrame(wrap, fg_color="transparent")
+        text_col.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(
+            text_col, text=label,
+            font=("Segoe UI Semibold", 12),
+            text_color=PALETTE["text"], anchor="w",
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            text_col, text=sub,
+            font=("Segoe UI", 10),
+            text_color=PALETTE["text_mute"], anchor="w", justify="left",
+            wraplength=300,
+        ).pack(anchor="w", pady=(2, 0))
 
-    # ---- actions ---------------------------------------------------------
+        sw = ctk.CTkSwitch(
+            wrap, text="", variable=var,
+            progress_color=PALETTE["accent"],
+            button_color="#FFFFFF",
+            button_hover_color="#FFFFFF",
+            fg_color=PALETTE["card_lo"],
+            command=command,
+            switch_width=44, switch_height=22,
+        )
+        sw.pack(side="right", padx=(8, 0))
+        return wrap
+
+    # ---- tabs ------------------------------------------------------------
+    def _on_tab_changed(self, value: str) -> None:
+        for t in (self._tab_home, self._tab_settings, self._tab_log):
+            try:
+                t.pack_forget()
+            except Exception:
+                pass
+        target = {
+            "Главная":   self._tab_home,
+            "Настройки": self._tab_settings,
+            "Журнал":    self._tab_log,
+        }.get(value, self._tab_home)
+        target.pack(fill="both", expand=True)
+
+    # ---- proxy actions ---------------------------------------------------
+    def _toggle_power(self) -> None:
+        if self.running:
+            self._stop()
+        else:
+            self._start()
 
     def _regen_secret(self) -> None:
         self.e_secret.delete(0, "end")
         self.e_secret.insert(0, secrets.token_hex(16))
-        self._update_banner()
+        self._on_cfg_dirty()
+
+    def _on_cfg_dirty(self) -> None:
+        # Subtitle hint when secret changed while running.
+        if self.running and self._applied_cfg:
+            cur = self._snapshot_cfg()
+            if cur.get("secret") != self._applied_cfg.get("secret"):
+                self._set_subtitle(
+                    "⚠  Секрет изменён. Жми «Применить и перезапустить»."
+                )
 
     def _on_autostart_toggle(self) -> None:
         ok = autostart.set_enabled(bool(self.var_autostart.get()))
         if not ok:
-            # Couldn't write registry — revert UI state.
             self.var_autostart.set(autostart.is_enabled())
 
     def _on_start_minimized_toggle(self) -> None:
@@ -659,36 +876,6 @@ class MainWindow:
             save_config(self.cfg)
         except Exception:
             pass
-
-    def _config_dirty(self) -> bool:
-        if not self._applied_cfg:
-            return False
-        cur = self._snapshot_cfg()
-        keys = ("host", "port", "secret", "cfproxy", "cfproxy_priority")
-        return any(cur.get(k) != self._applied_cfg.get(k) for k in keys)
-
-    def _update_banner(self) -> None:
-        if not self._config_dirty():
-            try:
-                self.banner.pack_forget()
-            except Exception:
-                pass
-            return
-        cur = self._snapshot_cfg()
-        if cur.get("secret") != self._applied_cfg.get("secret"):
-            txt = ("  ⚠  Секрет изменён. Нажмите «Применить и добавить в Telegram», "
-                   "чтобы прокси и клиент Telegram использовали один и тот же секрет.")
-        else:
-            txt = ("  ⚠  Настройки изменены. Нажмите «Применить и добавить в Telegram», "
-                   "чтобы прокси перезапустился с новыми значениями.")
-        try:
-            self.banner.configure(text=txt)
-            self.banner.pack(fill="x", side="top", before=self._body)
-        except Exception:
-            try:
-                self.banner.pack(fill="x", side="top")
-            except Exception:
-                pass
 
     def _link(self) -> str:
         try:
@@ -717,6 +904,13 @@ class MainWindow:
         except Exception:
             pass
 
+    def _config_dirty(self) -> bool:
+        if not self._applied_cfg:
+            return False
+        cur = self._snapshot_cfg()
+        keys = ("host", "port", "secret", "cfproxy", "cfproxy_priority")
+        return any(cur.get(k) != self._applied_cfg.get(k) for k in keys)
+
     def _start(self) -> None:
         cfg = self._snapshot_cfg()
         self.cfg.update(cfg)
@@ -737,38 +931,62 @@ class MainWindow:
         self.tailer.start()
         self._applied_cfg = dict(self.cfg)
         self._refresh_link()
-        self._update_banner()
         self._set_status(True)
 
     def _stop(self) -> None:
         stop_proxy()
         self._applied_cfg = {}
         self._set_status(False)
-        self._update_banner()
 
     def _apply_and_add(self) -> None:
         self._start()
-        self.root.after(300, self._open_in_telegram)
+        self.root.after(280, self._open_in_telegram)
 
     def _set_status(self, running: bool, err: Optional[str] = None) -> None:
         self.running = running
         if err:
             self.status_pill.configure(
-                text=f"●  ошибка: {err}",
-                text_color=PALETTE["danger"],
+                text=f"●  ошибка: {err}", text_color=PALETTE["err"],
+            )
+            self.orb.configure(text_color=PALETTE["err"])
+            self.hero_title.configure(text="Ошибка запуска")
+            self._set_subtitle(err)
+            self.power_btn.configure(
+                fg_color=PALETTE["accent"],
+                hover_color=PALETTE["accent_hi"],
             )
         elif running:
-            self.status_pill.configure(
-                text=f"●  {self.cfg.get('host')}:{self.cfg.get('port')}",
-                text_color=PALETTE["success"],
+            ep = f"{self.cfg.get('host')}:{self.cfg.get('port')}"
+            self.status_pill.configure(text=f"●  {ep}",
+                                       text_color=PALETTE["ok"])
+            self.orb.configure(text_color=PALETTE["ok"])
+            self.hero_title.configure(text="Прокси работает")
+            self._set_subtitle(
+                f"Слушаем {ep}. Жми тайл «Открыть в Telegram», чтобы пробросить ссылку.",
+            )
+            # Power button -> "stop" tone
+            self.power_btn.configure(
+                fg_color=PALETTE["err_dim"],
+                hover_color=PALETTE["err"],
             )
         else:
-            self.status_pill.configure(
-                text="●  остановлен",
-                text_color=PALETTE["danger"],
+            self.status_pill.configure(text="●  остановлен",
+                                       text_color=PALETTE["err"])
+            self.orb.configure(text_color=PALETTE["err_dim"])
+            self.hero_title.configure(text="Прокси остановлен")
+            self._set_subtitle("Нажми кнопку справа, чтобы запустить.")
+            self.power_btn.configure(
+                fg_color=PALETTE["accent"],
+                hover_color=PALETTE["accent_hi"],
             )
         try:
             self.tray.refresh()
+        except Exception:
+            pass
+
+    def _set_subtitle(self, text: str) -> None:
+        try:
+            self.hero_subtitle.configure(text=text)
         except Exception:
             pass
 
@@ -815,8 +1033,7 @@ class MainWindow:
         self.txt.delete("1.0", "end")
         self.txt.configure(state="disabled")
 
-    # ---- log pumping -----------------------------------------------------
-
+    # ---- log polling ----------------------------------------------------
     def _poll_log(self) -> None:
         if self._exiting:
             return
@@ -831,23 +1048,16 @@ class MainWindow:
                 drained += 1
         except queue.Empty:
             pass
-        self.root.after(120, self._poll_log)
+        self.root.after(140, self._poll_log)
 
-    # ---- tray / close handling ------------------------------------------
-
+    # ---- tray / lifecycle ----------------------------------------------
     def _minimize_to_tray(self) -> None:
         try:
             self.root.withdraw()
         except Exception:
             pass
-        if self.tray.is_available() and not self._tray_notice_shown:
-            self._tray_notice_shown = True
-            log.info("Teleproxy свёрнут в трей. Кликни иконку чтобы открыть.")
 
     def _on_close(self) -> None:
-        # Crucial UX point: closing the X must NOT kill the proxy when the
-        # tray is available — instead hide to tray. Only the tray menu's
-        # "Выход" actually exits.
         if self.tray.is_available():
             self._minimize_to_tray()
         else:
@@ -868,7 +1078,6 @@ class MainWindow:
             pass
 
     def _tray_toggle(self) -> None:
-        # Run on tk thread.
         def _do():
             if self.running:
                 self._stop()
@@ -923,11 +1132,13 @@ def run_gui(start_minimized: bool = False) -> None:
     cfg = load_config()
     bootstrap(cfg)
     if ctk is None:
-        ctypes.windll.user32.MessageBoxW(
-            None,
-            "customtkinter не установлен. Переустановите приложение.",
-            APP_TITLE, 0x10,
-        )
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                None, "customtkinter не установлен. Переустановите приложение.",
+                APP_TITLE, 0x10,
+            )
+        except Exception:
+            pass
         return
     if start_minimized is False and cfg.get("start_minimized"):
         start_minimized = True
