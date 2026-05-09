@@ -281,6 +281,101 @@ class TrayController:
 
 
 # ---------------------------------------------------------------------------
+# Canvas-drawn power button.
+#
+# customtkinter's CTkButton can't reliably render a perfect circle, and the
+# Unicode "⏻" power glyph isn't present in many bundled fonts (renders as a
+# tofu rectangle). We draw the whole control on a tk.Canvas: outer halo ring,
+# filled body circle, and the power symbol stitched from a line + a 270° arc.
+# ---------------------------------------------------------------------------
+class PowerButton(tk.Canvas):
+    def __init__(self, parent, *, size: int = 116, command=None,
+                 bg_color: str = None) -> None:
+        bg = bg_color or PALETTE["card"]
+        super().__init__(parent, width=size, height=size,
+                         bg=bg, highlightthickness=0, bd=0)
+        self._size = size
+        self._command = command
+        self._running = False
+        self._hover = False
+        self._pressed = False
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        try:
+            self.configure(cursor="hand2")
+        except Exception:
+            pass
+        self._draw()
+
+    def set_running(self, running: bool) -> None:
+        self._running = running
+        self._draw()
+
+    def _on_enter(self, _e) -> None:
+        self._hover = True
+        self._draw()
+
+    def _on_leave(self, _e) -> None:
+        self._hover = False
+        self._pressed = False
+        self._draw()
+
+    def _on_click(self, _e) -> None:
+        self._pressed = True
+        self._draw()
+
+    def _on_release(self, _e) -> None:
+        if self._pressed and self._command:
+            try:
+                self._command()
+            except Exception as exc:
+                log.warning("power click failed: %s", exc)
+        self._pressed = False
+        self._draw()
+
+    def _draw(self) -> None:
+        s = self._size
+        self.delete("all")
+        # Outer soft halo (filled translucent-feeling disc behind ring).
+        halo_pad = 2
+        self.create_oval(
+            halo_pad, halo_pad, s - halo_pad, s - halo_pad,
+            fill=PALETTE["card_hi"], outline=PALETTE["stroke_focus"], width=2,
+        )
+        # Inner body circle.
+        pad = 14
+        if self._running:
+            base = "#FF8FA9" if self._hover else PALETTE["err"]
+            base = "#E66B86" if self._pressed else base
+        else:
+            base = PALETTE["accent_hi"] if self._hover else PALETTE["accent"]
+            base = PALETTE["accent_lo"] if self._pressed else base
+        self.create_oval(
+            pad, pad, s - pad, s - pad,
+            fill=base, outline=base,
+        )
+        # Glyph drawn from primitives so it always renders.
+        cx, cy = s / 2, s / 2
+        glyph = "#1A1630"
+        # 270° arc, opening at the top-center
+        r = (s - pad * 2) * 0.30
+        self.create_arc(
+            cx - r, cy - r, cx + r, cy + r,
+            start=135, extent=270,
+            outline=glyph, width=5, style="arc",
+        )
+        # Vertical "stem" inside the gap
+        stem_top = cy - r - 4
+        stem_bot = cy - 2
+        self.create_line(
+            cx, stem_top, cx, stem_bot,
+            fill=glyph, width=5, capstyle="round",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Glass card helper.
 #
 # A "glass" card is a CTkFrame in card body color with a 1px top-edge
@@ -484,14 +579,13 @@ class MainWindow:
         inner = ctk.CTkFrame(hero, fg_color="transparent")
         inner.pack(fill="x", padx=24, pady=22)
 
-        # Status orb (color label that changes)
-        self.orb = ctk.CTkLabel(
-            inner, text="◉",
-            font=("Segoe UI Symbol", 56),
-            text_color=PALETTE["err_dim"],
-            fg_color="transparent",
-            width=72, height=72,
+        # Status orb — drawn on Canvas so it never depends on glyph fonts.
+        self.orb = tk.Canvas(
+            inner, width=72, height=72,
+            bg=PALETTE["card"], highlightthickness=0, bd=0,
         )
+        self._orb_color = PALETTE["err_dim"]
+        self._draw_orb()
         self.orb.pack(side="left", padx=(0, 18))
 
         text_col = ctk.CTkFrame(inner, fg_color="transparent")
@@ -512,26 +606,13 @@ class MainWindow:
         )
         self.hero_subtitle.pack(anchor="w", pady=(4, 0))
 
-        # Round power button (true circle: width=height, corner_radius=half)
-        power_halo = ctk.CTkFrame(
-            inner, fg_color=PALETTE["card_hi"],
-            border_color=PALETTE["stroke_focus"], border_width=2,
-            corner_radius=60, width=110, height=110,
-        )
-        power_halo.pack(side="right", padx=(8, 0))
-        power_halo.pack_propagate(False)
-
-        self.power_btn = ctk.CTkButton(
-            power_halo, text="⏻", width=92, height=92,
-            fg_color=PALETTE["accent"],
-            hover_color=PALETTE["accent_hi"],
-            text_color="#1A1630",
-            font=("Segoe UI Symbol", 36, "bold"),
-            corner_radius=46,  # half of 92 → perfect circle
-            border_width=0,
+        # Canvas-drawn round power button.
+        self.power_btn = PowerButton(
+            inner, size=116,
             command=self._toggle_power,
+            bg_color=PALETTE["card"],
         )
-        self.power_btn.place(relx=0.5, rely=0.5, anchor="center")
+        self.power_btn.pack(side="right", padx=(8, 0))
 
         # Action tiles
         actions = ctk.CTkFrame(page, fg_color="transparent")
@@ -958,39 +1039,49 @@ class MainWindow:
             self.status_pill.configure(
                 text=f"●  ошибка: {err}", text_color=PALETTE["err"],
             )
-            self.orb.configure(text_color=PALETTE["err"])
+            self._set_orb_color(PALETTE["err"])
             self.hero_title.configure(text="Ошибка запуска")
             self._set_subtitle(err)
-            self.power_btn.configure(
-                fg_color=PALETTE["accent"],
-                hover_color=PALETTE["accent_hi"],
-            )
+            self.power_btn.set_running(False)
         elif running:
             ep = f"{self.cfg.get('host')}:{self.cfg.get('port')}"
             self.status_pill.configure(text=f"●  {ep}",
                                        text_color=PALETTE["ok"])
-            self.orb.configure(text_color=PALETTE["ok"])
+            self._set_orb_color(PALETTE["ok"])
             self.hero_title.configure(text="Прокси работает")
             self._set_subtitle(
                 f"Слушаем {ep}. Жми тайл «Открыть в Telegram», чтобы пробросить ссылку.",
             )
-            # Power button -> "stop" tone
-            self.power_btn.configure(
-                fg_color=PALETTE["err_dim"],
-                hover_color=PALETTE["err"],
-            )
+            self.power_btn.set_running(True)
         else:
             self.status_pill.configure(text="●  остановлен",
                                        text_color=PALETTE["err"])
-            self.orb.configure(text_color=PALETTE["err_dim"])
+            self._set_orb_color(PALETTE["err_dim"])
             self.hero_title.configure(text="Прокси остановлен")
             self._set_subtitle("Нажми кнопку справа, чтобы запустить.")
-            self.power_btn.configure(
-                fg_color=PALETTE["accent"],
-                hover_color=PALETTE["accent_hi"],
-            )
+            self.power_btn.set_running(False)
         try:
             self.tray.refresh()
+        except Exception:
+            pass
+
+    def _draw_orb(self) -> None:
+        c = self.orb
+        c.delete("all")
+        # Outer faded ring
+        c.create_oval(4, 4, 68, 68,
+                      outline=PALETTE["stroke"], width=2)
+        # Inner filled disc
+        c.create_oval(14, 14, 58, 58,
+                      fill=self._orb_color, outline=self._orb_color)
+        # Bright inner highlight
+        c.create_oval(20, 20, 38, 32,
+                      fill="", outline="")
+
+    def _set_orb_color(self, color: str) -> None:
+        self._orb_color = color
+        try:
+            self._draw_orb()
         except Exception:
             pass
 
